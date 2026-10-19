@@ -174,6 +174,36 @@
     height:34px;padding:0 12px;color:var(--bone);font-size:10px;letter-spacing:.18em;
     cursor:pointer;
   }
+  /* Pit repair minigame */
+  #repair{
+    position:absolute;inset:0;display:flex;align-items:flex-end;justify-content:center;
+    padding:0 16px 96px;pointer-events:none;
+  }
+  #repair[hidden]{display:none}
+  .rp-card{
+    pointer-events:auto;width:100%;max-width:460px;padding:16px 18px 18px;text-align:center;
+    background:linear-gradient(180deg,rgba(10,13,17,.96),rgba(10,13,17,.9));
+    border:1px solid rgba(200,52,43,.7);border-top:3px solid #c8342b;
+    box-shadow:0 0 0 1px rgba(0,0,0,.6),0 14px 44px rgba(0,0,0,.6);
+  }
+  .rp-card h2{margin:4px 0 4px;font-size:22px;letter-spacing:.14em;text-transform:uppercase;color:var(--bone);font-weight:600}
+  .rp-card p{margin:0 0 12px;font-size:12px;letter-spacing:.04em;color:#9aa3ad;line-height:1.45}
+  .rp-nuts{display:flex;justify-content:center;gap:10px;margin-bottom:12px}
+  .rp-nuts i{width:16px;height:16px;border-radius:50%;border:2px solid rgba(232,227,216,.35);background:transparent}
+  .rp-nuts i.on{background:var(--sodium);border-color:var(--sodium);box-shadow:0 0 10px rgba(255,171,61,.7)}
+  .rp-bar{position:relative;height:26px;background:rgba(255,255,255,.07);border:1px solid rgba(232,227,216,.22);overflow:hidden}
+  .rp-zone{position:absolute;top:0;bottom:0;background:rgba(93,200,120,.5);border-left:1px solid #7be09a;border-right:1px solid #7be09a}
+  .rp-needle{position:absolute;top:-2px;bottom:-2px;width:4px;margin-left:-2px;background:#e8e3d8;box-shadow:0 0 8px rgba(232,227,216,.9)}
+  .rp-bar.miss{border-color:#c8342b;animation:rpshake .25s}
+  @keyframes rpshake{0%,100%{transform:translateX(0)}25%{transform:translateX(-5px)}75%{transform:translateX(5px)}}
+  #rpBtn{
+    margin-top:14px;padding:13px 0;width:100%;cursor:pointer;
+    background:var(--sodium);color:#0b0f14;border:0;font:inherit;font-weight:700;
+    font-size:14px;letter-spacing:.22em;text-transform:uppercase;touch-action:manipulation;
+  }
+  #rpBtn:active{filter:brightness(.85)}
+  .rp-msg{min-height:16px;margin-top:9px;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:#9aa3ad}
+
   /* Multiplayer */
   #mpboard{
     top:168px;right:14px;min-width:150px;padding:9px 12px;display:none;
@@ -334,6 +364,17 @@
     </div>
   </div>
 
+  <div id="repair" hidden>
+    <div class="rp-card">
+      <div class="eyebrow" style="color:#c8342b">Engine dead · 0 HP</div>
+      <h2>Pit repair</h2>
+      <p>Tap <b>Tighten</b> or press <b>Space</b> when the needle is in the green. Seat all four wheel nuts to get back out.</p>
+      <div class="rp-nuts" id="rpNuts"><i></i><i></i><i></i><i></i></div>
+      <div class="rp-bar" id="rpBar"><div class="rp-zone" id="rpZone"></div><div class="rp-needle" id="rpNeedle"></div></div>
+      <button id="rpBtn">Tighten</button>
+      <div class="rp-msg" id="rpMsg"></div>
+    </div>
+  </div>
   <div id="overlay">
     <div id="ovContent"></div>
   </div>
@@ -1434,6 +1475,7 @@ addEventListener("keydown",e=>{
     return;     // typing a name or room code is not driving
   }
   const playing=(state==="racing"||state==="countdown");
+  if(REPAIR.active&&(e.code==="Space"||e.code==="Enter")){ if(!e.repeat) repairHit(); e.preventDefault(); return; }
   if(KEYMAP[e.code]){ keys[KEYMAP[e.code]]=true; if(playing) e.preventDefault(); }
   if(e.code==="KeyR" && !MP.on && (state==="racing"||state==="countdown"||state==="paused")) resetRace();
   if(e.code==="Escape"||e.code==="KeyP"){
@@ -2233,7 +2275,15 @@ function step(dt){
 
   for(const c of cars){
     if(c.remote){ mpApplyRemote(c,dt); if(tick%2===0) emitFireIfDamaged(c); continue; }
-    if(c.finished){ applyDrive(c,dt,0,0,0,true); }
+    // at 0 HP the car is dead in the road until it is repaired
+    if(!c.finished&&!c.wrecked&&carIsDead(c)){ c.wrecked=true; c.wreckT=0; if(c.human) repairStart(c); }
+    if(c.wrecked){
+      c.wreckT+=dt; c.nitroActive=false;
+      applyDrive(c,dt,0,0,0,true);
+      const k=Math.pow(0.02,dt); c.speed*=k; c.vx*=k; c.vy*=k;
+      if(!c.human&&c.wreckT>8) repairCar(c);    // the field's mechanics are quicker than a thumb on a button
+    }
+    else if(c.finished){ applyDrive(c,dt,0,0,0,true); }
     else if(c.human) driveHuman(c,dt);
     else driveAI(c,dt);
     if(tick%3===0) laySkid(c);
@@ -5025,6 +5075,83 @@ function mpNameTags(p){
   ctx.restore();
 }
 
+/* ────────────────────────────── pit repair ──────────────────────────────
+   Zero HP leaves the car dead in the road. The driver has to win a small
+   timing game — seat four wheel nuts by stopping a sweeping needle inside
+   the green band — and the band narrows and the needle speeds up with each
+   nut. A miss costs a nut. Success wipes the damage and the car is driveable
+   again. Rivals that wreck sit for a few seconds and are patched up
+   automatically. */
+
+const REPAIR={active:false,car:null,nut:0,pos:0,dir:1,speed:1,zoneC:0.5,zoneW:0.24,lock:0,msgT:0};
+
+function carIsDead(c){
+  const z=c.dmgZone; if(!z) return false;
+  return Math.max(z.front||0,z.rear||0,z.left||0,z.right||0)>=0.999;
+}
+function repairCar(c){
+  c.dmgZone={front:0,rear:0,left:0,right:0};
+  c.damage=0; c.wrecked=false; c.wreckT=0; c.crash=0; c.av=0; c.immune=1.6;
+}
+function repairRound(){
+  const n=REPAIR.nut;
+  REPAIR.zoneW=Math.max(0.10,0.26-n*0.05);
+  REPAIR.zoneC=0.2+Math.random()*0.6;
+  REPAIR.speed=0.85+n*0.3;
+  REPAIR.pos=Math.random()<0.5?0:1; REPAIR.dir=REPAIR.pos===0?1:-1;
+  const z=el("rpZone");
+  z.style.left=((REPAIR.zoneC-REPAIR.zoneW/2)*100)+"%";
+  z.style.width=(REPAIR.zoneW*100)+"%";
+  [...el("rpNuts").children].forEach((d,i)=>d.classList.toggle("on",i<n));
+}
+function repairMsg(t){ el("rpMsg").textContent=t; REPAIR.msgT=1.4; }
+function repairStart(c){
+  REPAIR.active=true; REPAIR.car=c; REPAIR.nut=0; REPAIR.lock=0.6;
+  el("repair").hidden=false;
+  repairMsg("Car is dead — fix it to get going");
+  repairRound();
+  beep(180,0.25,"sawtooth",0.22);
+}
+function repairCancel(){
+  REPAIR.active=false; REPAIR.car=null;
+  const r=el("repair"); if(r) r.hidden=true;
+}
+function repairHit(){
+  if(!REPAIR.active||REPAIR.lock>0) return;
+  const hit=Math.abs(REPAIR.pos-REPAIR.zoneC)<=REPAIR.zoneW/2;
+  if(hit){
+    REPAIR.nut++;
+    beep(700+REPAIR.nut*140,0.08,"square",0.16);
+    if(REPAIR.nut>=4){
+      const c=REPAIR.car; repairCancel(); if(c) repairCar(c);
+      chime();
+      return;
+    }
+    repairMsg("Nut seated — "+(4-REPAIR.nut)+" to go");
+    repairRound();
+  } else {
+    REPAIR.nut=Math.max(0,REPAIR.nut-1);
+    REPAIR.lock=0.35;
+    beep(150,0.18,"sawtooth",0.2);
+    const bar=el("rpBar"); bar.classList.remove("miss"); void bar.offsetWidth; bar.classList.add("miss");
+    repairMsg("Missed — cross-threaded");
+    repairRound();
+  }
+}
+function repairTick(dt){
+  if(!REPAIR.active) return;
+  // a restart or a new race builds new cars — the old repair is moot
+  if(!cars.length||cars[0]!==REPAIR.car||!REPAIR.car.wrecked){ repairCancel(); return; }
+  if(state!=="racing") return;
+  REPAIR.lock=Math.max(0,REPAIR.lock-dt);
+  REPAIR.pos+=REPAIR.dir*REPAIR.speed*dt;
+  if(REPAIR.pos>=1){ REPAIR.pos=1; REPAIR.dir=-1; }
+  else if(REPAIR.pos<=0){ REPAIR.pos=0; REPAIR.dir=1; }
+  el("rpNeedle").style.left=(REPAIR.pos*100)+"%";
+  if(REPAIR.msgT>0){ REPAIR.msgT-=dt; if(REPAIR.msgT<=0) el("rpMsg").textContent=""; }
+}
+el("rpBtn").addEventListener("pointerdown",e=>{ e.preventDefault(); repairHit(); });
+
 /* ────────────────────────────── loop ────────────────────────────── */
 
 let prevT=performance.now(), acc=0;
@@ -5045,6 +5172,7 @@ function frame(now){
   render();
   updateHud();
   if(MP.on) mpTick(now);
+  repairTick(dt);
   requestAnimationFrame(frame);
 }
 
