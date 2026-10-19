@@ -340,6 +340,30 @@
 </div>
 
 <script>
+/* If the game ever fails to start, say why on screen instead of showing a dark page. */
+(function(){
+  function show(msg){
+    try{
+      var d=document.getElementById("errbox");
+      if(!d){
+        d=document.createElement("pre"); d.id="errbox";
+        d.style.cssText="position:fixed;left:12px;right:12px;bottom:12px;z-index:99999;margin:0;padding:12px 14px;"+
+          "background:#2a0d0d;color:#ffb4a8;border:1px solid #c8342b;font:12px/1.4 ui-monospace,Menlo,Consolas,monospace;"+
+          "white-space:pre-wrap;max-height:40vh;overflow:auto;user-select:text";
+        (document.body||document.documentElement).appendChild(d);
+      }
+      d.textContent+=msg+"\n";
+    }catch(x){}
+  }
+  window.addEventListener("error",function(e){
+    show("Error: "+(e.message||e.type)+(e.filename?"\n  at line "+e.lineno+":"+e.colno:"")+
+         (e.error&&e.error.stack?"\n"+String(e.error.stack).split("\n").slice(0,4).join("\n"):"")+
+         "\nBrowser: "+navigator.userAgent);
+  });
+  window.addEventListener("unhandledrejection",function(e){ show("Promise error: "+(e.reason&&e.reason.message||e.reason)); });
+})();
+</script>
+<script>
 (() => {
 "use strict";
 
@@ -1405,12 +1429,12 @@ const KEYMAP={ArrowUp:"gas",KeyW:"gas",ArrowDown:"brake",KeyS:"brake",
 addEventListener("pointerdown",ensureAudio,{once:true});
 addEventListener("keydown",ensureAudio,{once:true});
 addEventListener("keydown",e=>{
-  const playing=(state==="racing"||state==="countdown");
-  if(KEYMAP[e.code]){ keys[KEYMAP[e.code]]=true; if(playing) e.preventDefault(); }
   if(e.target&&(e.target.tagName==="INPUT"||e.target.tagName==="SELECT")){
     if(e.code==="Enter"&&e.target.dataset.enter){ const b=el(e.target.dataset.enter); if(b) b.click(); }
     return;     // typing a name or room code is not driving
   }
+  const playing=(state==="racing"||state==="countdown");
+  if(KEYMAP[e.code]){ keys[KEYMAP[e.code]]=true; if(playing) e.preventDefault(); }
   if(e.code==="KeyR" && !MP.on && (state==="racing"||state==="countdown"||state==="paused")) resetRace();
   if(e.code==="Escape"||e.code==="KeyP"){
     if(state==="racing"||state==="countdown"){
@@ -1583,6 +1607,7 @@ function updateCarAudio(p){
 /* ────────────────────────────── simulation ────────────────────────────── */
 
 function driveHuman(c,dt){
+  if(MP.on&&!overlay.classList.contains("hidden")){ applyDrive(c,dt,0,0,0,false); return; }
   const gas=keys.gas?1:0, brake=keys.brake?1:0;
   let steerIn=(keys.left?-1:0)+(keys.right?1:0);
   applyDrive(c,dt,gas,brake,steerIn,keys.hand,keys.nitro);
@@ -2134,11 +2159,13 @@ function collide(){
 
       const rvx=a.vx-b.vx, rvy=a.vy-b.vy;
       const closing=rvx*nx+rvy*ny;          // along the contact normal only
-      if(closing>Math.min(a.human?296:22,b.human?296:22)){
+      const ta=(a.human||a.remote)?296:22, tb=(b.human||b.remote)?296:22;
+      if(closing>Math.min(ta,tb)){
         const sgn=Math.sign(nx*rvy-ny*rvx)||1;
-        // the player's own threshold never drops — only how easily an AI spins does
-        if(closing>(a.human?296:22)) crash(a,closing,sgn,nx,ny);
-        if(closing>(b.human?296:22)) crash(b,closing,-sgn,-nx,-ny);
+        // the player's own threshold never drops — only how easily an AI spins does.
+        // A remote driver's own machine decides whether *they* crash.
+        if(closing>ta&&!a.remote) crash(a,closing,sgn,nx,ny);
+        if(closing>tb&&!b.remote) crash(b,closing,-sgn,-nx,-ny);
       }
     }
   }
@@ -2205,6 +2232,7 @@ function step(dt){
   tick++;
 
   for(const c of cars){
+    if(c.remote){ mpApplyRemote(c,dt); if(tick%2===0) emitFireIfDamaged(c); continue; }
     if(c.finished){ applyDrive(c,dt,0,0,0,true); }
     else if(c.human) driveHuman(c,dt);
     else driveAI(c,dt);
@@ -2231,7 +2259,15 @@ function step(dt){
 
   const order=standings();
   order.forEach((c,i)=>c.place=i+1);
-  if(mode==="race" && cars[0].finished) endRace();
+  if(mode==="race" && cars[0].finished){
+    if(!MP.on) endRace();
+    else {
+      // shared room: wait for the others to cross the line, but not forever
+      if(!MP.finSince) MP.finSince=raceTime;
+      const rest=cars.filter(c=>c.remote);
+      if(rest.every(c=>c.finished)||raceTime-MP.finSince>20) endRace();
+    }
+  }
 }
 
 function endRace(){
@@ -3606,7 +3642,7 @@ function drawCar(g,c,zoom){
 
 function render(){
   const p=cars.length?cars[0]:null;
-  if(p&&camMode!==3) render3D(p); else render2D(p);
+  if(p&&camMode!==3){ render3D(p); if(MP.on&&MP.racing) mpNameTags(p); } else render2D(p);
   if(p&&camMode===4){ drawCockpit(p); drawMirrors(p); }
 
   const v=ctx.createRadialGradient(VW/2,VH/2,Math.min(VW,VH)*0.34,VW/2,VH/2,Math.max(VW,VH)*0.78);
@@ -4101,7 +4137,7 @@ function updateHud(){
     el("lap").textContent=String(Math.max(0,p.lap));
   } else {
     el("poslabel").textContent="Position";
-    el("pos").textContent=`${p.place}/4`;
+    el("pos").textContent=`${p.place}/${cars.length}`;
     el("laplabel").textContent="Lap";
     el("lap").textContent=`${Math.min(Math.max(p.lap,1),TOTAL_LAPS)}/${TOTAL_LAPS}`;
   }
@@ -4120,7 +4156,9 @@ function updateHud(){
   if(state==="countdown"){
     const n=Math.ceil(countdown-0.6);
     ct.textContent=n>0?String(n):"GO";
-  } else ct.textContent="";
+  } else if(MP.on&&MP.racing&&mode==="race"&&p.finished) ct.textContent="P"+p.place;
+  else ct.textContent="";
+  mpBoard();
 }
 
 const overlay=el("overlay"), ovc=el("ovContent");
@@ -4154,10 +4192,12 @@ function showMenu(){
       <b>T</b><span>Back to the calendar — swap circuits</span>
     </div>
     <button class="cta" id="startBtn">Race — three laps</button>
-    <button class="ghost" id="freeBtn">Free drive — no clock, no rivals</button>`;
+    <button class="ghost" id="freeBtn">Free drive — no clock, no rivals</button>
+    <button class="ghost" id="mpBtn">Multiplayer — race or cruise with friends</button>`;
   el("startBtn").focus();
   el("startBtn").onclick=()=>{ mode="race"; showTracks(); };
   el("freeBtn").onclick=()=>{ mode="free"; showTracks(); };
+  el("mpBtn").onclick=()=>{ mpShowEntry(); };
 }
 
 function drawTrackPreview(cnv,i){
@@ -4264,7 +4304,11 @@ function showGarage(){
   [...ovc.querySelectorAll(".card")].forEach(btn=>{
     const i=+btn.dataset.i;
     drawPreview(btn.querySelector("canvas"),VEHICLES[i]);
-    btn.onclick=()=>{ pickedVeh=i; overlay.classList.add("hidden"); resetRace(); };
+    btn.onclick=()=>{
+      pickedVeh=i;
+      if(MP.on){ mpSendLobby(); showLobby(); return; }
+      overlay.classList.add("hidden"); resetRace();
+    };
   });
   const first=ovc.querySelector(".card"); if(first) first.focus();
 }
@@ -4272,6 +4316,7 @@ function showGarage(){
 let prePause="racing";
 
 function showPause(){
+  if(MP.on){ mpShowPause(); return; }
   prePause=(state==="countdown")?"countdown":"racing";
   state="paused";
   overlay.classList.remove("hidden");
@@ -4328,13 +4373,21 @@ function showResults(order){
       ${rows}
     </table>
     <p class="sub">Your best lap around ${CIRCUITS[pickedTrack].name} in the ${you.carName}: ${fmt(you.bestLapT)}.</p>
-    <button class="cta" id="againBtn">Same again</button>
+    ${MP.on
+      ? `<button class="cta" id="againBtn">Back to the paddock</button>
+         <div class="btnrow"><button class="ghost" id="leaveBtn">Leave room</button></div>`
+      : `<button class="cta" id="againBtn">Same again</button>
     <div class="btnrow">
       <button class="ghost" id="swapBtn">Change car</button>
       <button class="ghost" id="trackBtn">Change circuit</button>
       <button class="ghost" id="modeBtn2">${mode==="free"?"Switch to racing":"Switch to free drive"}</button>
-    </div>`;
+    </div>`}`;
   el("againBtn").focus();
+  if(MP.on){
+    el("againBtn").onclick=mpToLobby;
+    el("leaveBtn").onclick=mpLeave;
+    return;
+  }
   el("againBtn").onclick=()=>{ overlay.classList.add("hidden"); resetRace(); };
   el("swapBtn").onclick=showGarage;
   el("trackBtn").onclick=showTracks;
@@ -4343,6 +4396,633 @@ function showResults(order){
     overlay.classList.add("hidden");
     resetRace();
   };
+}
+
+/* ── peer-to-peer transport ─────────────────────────────────────────────
+   Used when the game is hosted anywhere other than claude.ai (GitHub Pages,
+   Vercel…). It offers the same small room interface the claude.ai runtime
+   does — join, presence, peers, onPeers, leave — so the multiplayer code
+   above it doesn't change.
+   Browsers talk to each other directly over WebRTC (PeerJS handles the
+   introductions through its free public matchmaking server; no account or
+   key). The first player to open a room code registers a "hub" id derived
+   from the code, and everyone else connects to that hub, which relays
+   presence between members. Players keep their own stable member id, so if
+   the hub's tab closes, a remaining player re-registers as the new hub and
+   the others reconnect to it without losing their place in the race. */
+
+function mpLoadPeerLib(){
+  if(window.Peer) return Promise.resolve(true);
+  const urls=["https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js",
+              "https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"];
+  return new Promise(resolve=>{
+    let i=0;
+    const next=()=>{
+      if(window.Peer) return resolve(true);
+      if(i>=urls.length) return resolve(false);
+      const s=document.createElement("script");
+      s.src=urls[i++];
+      s.onload=()=>{ if(window.Peer) resolve(true); else next(); };
+      s.onerror=next;
+      document.head.appendChild(s);
+    };
+    next();
+  });
+}
+
+const p2pApi={
+  async join(name){
+    if(!(await mpLoadPeerLib())) throw {code:"upstream_error",message:"peer library unavailable"};
+    const cfg=window.SODIUM_PEER||{};
+    const hubId="sodiumcircuit-"+String(name).toLowerCase().replace(/[^a-z0-9]+/g,"-").replace(/^-+|-+$/g,"").slice(0,40);
+    const uid="u"+Math.random().toString(36).slice(2,12)+Date.now().toString(36).slice(-4);
+
+    const st={
+      me:uid, hub:false, left:false,
+      peer:null,                 // our PeerJS object (hub id when hub, anonymous when client)
+      up:null,                   // client: connection to the hub
+      members:new Map(),         // hub: uid -> connection
+      map:new Map(),             // uid -> frozen presence
+      stamp:new Map(),           // uid -> ms of last change
+      mine:{}, handlers:new Set(), errHandlers:new Set(),
+      nq:false, sendT:0, mig:false, pruneT:0
+    };
+
+    const notify=()=>{
+      if(st.nq||st.left) return;
+      st.nq=true;
+      setTimeout(()=>{
+        st.nq=false; if(st.left) return;
+        const peers=snap();
+        st.handlers.forEach(h=>{ try{ h({peers,joined:[],left:[],updated:[]}); }catch(e){} });
+      },12);
+    };
+    const snap=()=>[...st.map.entries()].map(([id,p])=>({
+      peer:id, presence:p, sameTab:id===st.me, isMe:id===st.me,
+      kind:"viewer", guest:false, updatedAt:st.stamp.get(id)||0
+    }));
+    const setPres=(id,p)=>{ st.map.set(id,Object.freeze({...p})); st.stamp.set(id,Date.now()); notify(); };
+    const dropPres=id=>{ if(st.map.delete(id)){ st.stamp.delete(id); notify(); } };
+    const allPres=()=>{ const o={}; st.map.forEach((p,id)=>{ o[id]=p; }); return o; };
+    const safeSend=(c,m)=>{ try{ if(c&&c.open!==false) c.send(m); }catch(e){} };
+    const relay=(m,except)=>{ st.members.forEach((c,id)=>{ if(id!==except) safeSend(c,m); }); };
+
+    /* hub role */
+    const hubAccept=conn=>{
+      let uidOf=null;
+      conn.on("data",m=>{
+        if(!m||typeof m!=="object") return;
+        if(m.t==="hi"&&typeof m.uid==="string"&&m.uid.length<40&&m.uid!==st.me){
+          uidOf=m.uid;
+          const old=st.members.get(uidOf);
+          if(old&&old!==conn){ try{ old.close(); }catch(e){} }
+          st.members.set(uidOf,conn);
+          if(m.p&&typeof m.p==="object") setPres(uidOf,m.p);
+          safeSend(conn,{t:"snap",p:allPres()});
+          relay({t:"u",id:uidOf,p:st.map.get(uidOf)||{}},uidOf);
+        } else if(m.t==="p"&&uidOf&&m.p&&typeof m.p==="object"){
+          setPres(uidOf,m.p);
+          relay({t:"u",id:uidOf,p:m.p},uidOf);
+        }
+      });
+      const gone=()=>{
+        if(uidOf&&st.members.get(uidOf)===conn){
+          st.members.delete(uidOf); dropPres(uidOf); relay({t:"bye",id:uidOf});
+        }
+      };
+      conn.on("close",gone); conn.on("error",gone);
+    };
+    const becomeHub=peer=>{
+      st.hub=true; st.peer=peer; st.up=null;
+      peer.on("connection",hubAccept);
+      peer.on("disconnected",()=>{ try{ if(!st.left) peer.reconnect(); }catch(e){} });
+      peer.on("error",()=>{});
+      if(!st.map.has(st.me)) setPres(st.me,st.mine);
+      // after a hub hand-over, members that never reconnect are let go
+      if(st.mig){
+        clearTimeout(st.pruneT);
+        st.pruneT=setTimeout(()=>{
+          [...st.map.keys()].forEach(id=>{ if(id!==st.me&&!st.members.has(id)){ dropPres(id); relay({t:"bye",id}); } });
+          st.mig=false;
+        },5000);
+      }
+    };
+
+    /* client role */
+    const clientData=m=>{
+      if(!m||typeof m!=="object") return;
+      if(m.t==="snap"&&m.p&&typeof m.p==="object"){
+        for(const id in m.p) if(id!==st.me&&m.p[id]&&typeof m.p[id]==="object") setPres(id,m.p[id]);
+      } else if(m.t==="u"&&typeof m.id==="string"&&m.id!==st.me&&m.p&&typeof m.p==="object"){
+        setPres(m.id,m.p);
+      } else if(m.t==="bye"&&typeof m.id==="string"&&m.id!==st.me){
+        dropPres(m.id);
+      }
+    };
+
+    const makePeer=(id)=>new Promise(resolve=>{
+      let done=false;
+      const fin=v=>{ if(!done){ done=true; resolve(v); } };
+      let p;
+      try{ p=id?new window.Peer(id,cfg):new window.Peer(cfg); }
+      catch(e){ return fin({err:"fail"}); }
+      p.on("open",()=>fin({peer:p}));
+      p.on("error",e=>{ if(!done){ fin({err:(e&&e.type)||"fail"}); try{ p.destroy(); }catch(x){} } });
+      setTimeout(()=>{ if(!done){ fin({err:"timeout"}); try{ p.destroy(); }catch(x){} } },10000);
+    });
+
+    const connectToHub=peer=>new Promise(resolve=>{
+      let done=false;
+      const fin=v=>{ if(!done){ done=true; resolve(v); } };
+      let conn;
+      try{ conn=peer.connect(hubId,{serialization:"json"}); }catch(e){ return fin("fail"); }
+      conn.on("open",()=>{
+        st.up=conn;
+        conn.on("data",clientData);
+        safeSend(conn,{t:"hi",uid:st.me,p:st.mine});
+        fin("ok");
+      });
+      conn.on("close",()=>{ if(st.up===conn){ st.up=null; migrate(); } });
+      conn.on("error",()=>{ if(st.up===conn){ st.up=null; migrate(); } else fin("fail"); });
+      peer.on("error",e=>{ if(e&&e.type==="peer-unavailable") fin("gone"); });
+      setTimeout(()=>fin("timeout"),9000);
+    });
+
+    // one attempt at taking a role: first try to be the hub, else join it
+    const attach=async()=>{
+      const h=await makePeer(hubId);
+      if(h.peer){ becomeHub(h.peer); return "ok"; }
+      if(h.err!=="unavailable-id") return "fail";
+      const c=await makePeer(null);
+      if(!c.peer) return "fail";
+      const r=await connectToHub(c.peer);
+      if(r==="ok"){ st.hub=false; st.peer=c.peer; return "ok"; }
+      try{ c.peer.destroy(); }catch(e){}
+      return r==="gone"?"retry":"fail";
+    };
+
+    let migrating=false;
+    async function migrate(){
+      if(st.left||migrating) return;
+      migrating=true; st.mig=true;
+      for(let i=0;i<5&&!st.left;i++){
+        await new Promise(r=>setTimeout(r,350+Math.random()*900));
+        if(st.left) break;
+        try{ if(st.peer) st.peer.destroy(); }catch(e){}
+        st.peer=null;
+        const r=await attach();
+        if(r==="ok"){ migrating=false; return; }
+      }
+      migrating=false;
+      if(!st.left) st.errHandlers.forEach(h=>{ try{ h({code:"upstream_error",message:"lost the room"}); }catch(e){} });
+    }
+
+    setPres(st.me,st.mine);
+    let ok=false;
+    for(let i=0;i<4&&!ok;i++){
+      const r=await attach();
+      if(r==="ok") ok=true;
+      else if(r==="fail") break;
+      else await new Promise(res=>setTimeout(res,300));
+    }
+    if(!ok){ st.left=true; throw {code:"upstream_error",message:"could not reach the matchmaking service"}; }
+
+    const flush=()=>{
+      st.sendT=0;
+      if(st.left) return;
+      if(st.hub) relay({t:"u",id:st.me,p:st.mine});
+      else if(st.up) safeSend(st.up,{t:"p",p:st.mine});
+    };
+    return {
+      peers:()=>snap(),
+      onPeers(h,onError){
+        st.handlers.add(h); if(onError) st.errHandlers.add(onError);
+        return ()=>{ st.handlers.delete(h); if(onError) st.errHandlers.delete(onError); };
+      },
+      presence(patch){
+        for(const k in patch){ if(patch[k]===null) delete st.mine[k]; else st.mine[k]=patch[k]; }
+        setPres(st.me,st.mine);
+        if(!st.sendT) st.sendT=setTimeout(flush,33);
+        return Promise.resolve();
+      },
+      leave(){
+        st.left=true; clearTimeout(st.sendT); clearTimeout(st.pruneT);
+        try{ st.members.forEach(c=>{ try{ c.close(); }catch(e){} }); }catch(e){}
+        try{ if(st.up) st.up.close(); }catch(e){}
+        try{ if(st.peer) st.peer.destroy(); }catch(e){}
+        st.handlers.clear(); st.errHandlers.clear();
+        return Promise.resolve();
+      }
+    };
+  }
+};
+
+/* ────────────────────────────── multiplayer ──────────────────────────────
+   Players meet in a named room on the page's shared-room channel. Nothing is
+   simulated centrally: every machine drives its own car with the normal
+   physics and publishes its state (position, heading, speed, lap, damage)
+   as presence about fifteen times a second; everyone else draws that car,
+   eased toward where it should be by now. The host's presence carries the
+   "go" that starts a race — circuit, mode and the grid order — so late
+   packets and reconnects can't lose it. Only presence is used, so any
+   level of access to the page is enough to take part. */
+
+const MP={
+  on:false, racing:false,
+  api:null, room:null, code:"", name:"", me:"",
+  ep:0, roster:[], rem:{}, unsubs:[],
+  lobbyTrack:0, lobbyMode:"race",
+  lastSend:0, finSince:0, boardHtml:"", boardOn:false, ctlSig:"", dead:false
+};
+const MP_MAX=8;
+
+function mpClean(s,n){ return String(s==null?"":s).replace(/[^A-Za-z0-9 _\-]/g,"").trim().slice(0,n||12).toUpperCase(); }
+function mpNum(v,d){ return (typeof v==="number"&&isFinite(v))?v:(d||0); }
+function mpLoadName(){
+  try{ const n=localStorage.getItem("sodium_name"); if(n){ const c=mpClean(n); if(c) return c; } }catch(e){}
+  return "RACER"+(10+Math.floor(Math.random()*90));
+}
+function mpSaveName(n){ try{ localStorage.setItem("sodium_name",n); }catch(e){} }
+function mpRandomCode(){
+  const a="abcdefghjkmnpqrstuvwxyz"; let s="";
+  for(let i=0;i<4;i++) s+=a[Math.floor(Math.random()*a.length)];
+  return s;
+}
+
+async function mpGetApi(){
+  if(MP.api) return MP.api;
+  try{ if(window.claude&&typeof window.claude.use==="function") MP.api=await window.claude.use("room"); }
+  catch(e){ MP.api=null; }
+  if(!MP.api) MP.api=p2pApi;           // anywhere but claude.ai: direct peer-to-peer
+  return MP.api;
+}
+
+function mpMyPeer(){
+  if(MP.me) return MP.me;
+  if(!MP.room) return "";
+  const m=MP.room.peers().find(p=>p.sameTab);
+  if(m) MP.me=m.peer;
+  return MP.me;
+}
+
+// everyone in the paddock, in one fixed order (the host is first)
+function mpPlayers(){
+  if(!MP.room) return [];
+  const out=[];
+  for(const p of MP.room.peers()){
+    const pr=p.presence||{};
+    if(p.kind!=="viewer"||typeof pr.nm!=="string") continue;
+    const v=Math.floor(mpNum(pr.vh,0));
+    out.push({
+      peer:p.peer, me:!!p.sameTab, nm:mpClean(pr.nm)||"DRIVER",
+      vh:(v>=0&&v<VEHICLES.length)?v:0,
+      ph:pr.ph==="race"?"race":"lobby",
+      lt:Math.floor(mpNum(pr.lt,0)), lm:pr.lm==="free"?"free":"race",
+      go:pr.go||null
+    });
+  }
+  out.sort((a,b)=>a.peer<b.peer?-1:a.peer>b.peer?1:0);
+  return out;
+}
+
+function mpSendLobby(){
+  if(!MP.room) return;
+  MP.room.presence({nm:MP.name, vh:pickedVeh, ph:"lobby", lt:MP.lobbyTrack, lm:MP.lobbyMode}).catch(()=>{});
+}
+
+/* ── entry and lobby screens ── */
+
+function mpShowEntry(){
+  state="lobby";
+  overlay.classList.remove("hidden");
+  MP.name=MP.name||mpLoadName();
+  ovc.innerHTML=`
+    <div class="eyebrow">Multiplayer</div>
+    <h1 class="title">Join the <span>paddock</span></h1>
+    <p class="sub">Pick a driver name and a room code. Everyone who enters the same code lands in the same
+    session, on the same circuit, live on track together. The host chooses race or free drive. Send your
+    friends the link to this page and your room code.</p>
+    <div class="mpform">
+      <label for="mpName">Driver name</label>
+      <input id="mpName" maxlength="12" autocomplete="off" spellcheck="false" data-enter="mpJoinBtn" value="${MP.name}">
+      <label for="mpCode">Room code</label>
+      <input id="mpCode" maxlength="24" autocomplete="off" spellcheck="false" data-enter="mpJoinBtn" value="${mpRandomCode().toUpperCase()}">
+    </div>
+    <div class="mperr" id="mpErr"></div>
+    <button class="cta" id="mpJoinBtn">Join room</button>
+    <button class="ghost" id="mpBackBtn">Back</button>`;
+  el("mpBackBtn").onclick=showMenu;
+  el("mpJoinBtn").onclick=async()=>{
+    const btn=el("mpJoinBtn"), err=el("mpErr");
+    MP.name=mpClean(el("mpName").value)||mpLoadName();
+    mpSaveName(MP.name);
+    btn.disabled=true; err.textContent="Connecting…";
+    const msg=await mpJoin(el("mpCode")?el("mpCode").value:"");
+    if(msg&&el("mpErr")){ el("mpErr").textContent=msg; el("mpJoinBtn").disabled=false; }
+  };
+  el("mpJoinBtn").focus();
+}
+
+async function mpJoin(raw){
+  const api=await mpGetApi();
+  if(!api||typeof api.join!=="function") return "Multiplayer isn't available here.";
+  const code=String(raw||"").toLowerCase().replace(/[^a-z0-9_.\-]/g,"").slice(0,24);
+  if(!code) return "Enter a room code.";
+  let room;
+  try{ room=await api.join("sc-"+code); }
+  catch(e){
+    return (e&&e.code==="not_permitted")
+      ? "Shared rooms aren't available to your account on this page."
+      : "Couldn't reach the matchmaking service. Check your connection and try again.";
+  }
+  MP.room=room; MP.code=code; MP.on=true; MP.racing=false; MP.me="";
+  MP.ep=0; MP.rem={}; MP.finSince=0; MP.dead=false; MP.ctlSig="";
+  MP.lobbyTrack=0; MP.lobbyMode="race";
+  MP.unsubs=[ room.onPeers(mpPeersChanged, ()=>{ MP.dead=true; if(state==="lobby"&&el("mpErr")) el("mpErr").textContent="Lost the connection to the room."; }) ];
+  mpSendLobby();
+  showLobby();
+  return "";
+}
+
+async function mpLeave(){
+  for(const u of MP.unsubs){ try{ u(); }catch(e){} }
+  MP.unsubs=[];
+  const r=MP.room;
+  MP.room=null; MP.on=false; MP.racing=false; MP.rem={}; MP.me=""; MP.roster=[];
+  try{ if(r) await r.leave(); }catch(e){}
+  mode="race";
+  cars=buildField(); snapCam();
+  el("mpboard").style.display="none"; MP.boardOn=false;
+  showMenu();
+}
+
+function showLobby(){
+  state="lobby";
+  overlay.classList.remove("hidden");
+  MP.ctlSig="";
+  ovc.innerHTML=`
+    <div class="eyebrow">Multiplayer · room ${MP.code.toUpperCase()}</div>
+    <h1 class="title">The <span>paddock</span></h1>
+    <p class="sub" id="mpSub"></p>
+    <div class="plist" id="mpList"></div>
+    <div id="mpCtl" style="width:100%;display:flex;flex-direction:column;align-items:center"></div>
+    <div class="mperr" id="mpErr"></div>
+    <button class="cta" id="mpStart" disabled>Waiting for the host</button>
+    <div class="mpform" style="max-width:260px;margin-top:14px">
+      <label for="mpName2">Your name</label>
+      <input id="mpName2" maxlength="12" autocomplete="off" spellcheck="false" value="${MP.name}">
+    </div>
+    <div class="btnrow">
+      <button class="ghost" id="mpCar">Change car</button>
+      <button class="ghost" id="mpLeaveBtn">Leave room</button>
+    </div>`;
+  el("mpName2").onchange=()=>{
+    MP.name=mpClean(el("mpName2").value)||MP.name; el("mpName2").value=MP.name;
+    mpSaveName(MP.name); mpSendLobby();
+  };
+  el("mpCar").onclick=showGarage;
+  el("mpLeaveBtn").onclick=mpLeave;
+  el("mpStart").onclick=mpStartRace;
+  mpRefreshLobby();
+}
+
+function mpRefreshLobby(){
+  if(state!=="lobby"||!MP.on||!el("mpList")) return;
+  const ps=mpPlayers(), host=ps[0], iHost=!!(host&&host.me);
+  if(host&&!iHost){ MP.lobbyTrack=host.lt; MP.lobbyMode=host.lm; }
+  if(!(MP.lobbyTrack>=0&&MP.lobbyTrack<CIRCUITS.length)) MP.lobbyTrack=0;
+  if(MP.lobbyMode==="race"&&CIRCUITS[MP.lobbyTrack].freeOnly){
+    MP.lobbyTrack=Math.max(0,CIRCUITS.findIndex(c=>!c.freeOnly));
+  }
+
+  el("mpList").innerHTML=ps.map((p,i)=>`
+    <div class="pl${p.me?" me":""}">
+      <span class="sw" style="background:${VEHICLES[p.vh].color}"></span>
+      <span class="nm">${p.nm}${p.me?" (you)":""}</span>
+      <span class="tag">${VEHICLES[p.vh].name}</span>
+      <span class="tag${i===0?" host":""}">${i===0?"host":p.ph==="race"?"racing":"ready"}</span>
+    </div>`).join("")||`<div class="pl"><span class="nm">Connecting…</span></div>`;
+
+  const inProgress=host&&host.go&&host.go.e!==MP.ep&&!(Array.isArray(host.go.r)&&host.go.r.some(a=>a&&a[0]===mpMyPeer()));
+  el("mpSub").textContent = inProgress
+    ? "A session is already under way. You'll join the next one."
+    : ps.length<2
+      ? "Share the room code, or wait for someone to join. You can start alone to try the circuit."
+      : ps.length+" drivers in the paddock.";
+
+  const sig=[iHost,MP.lobbyMode,MP.lobbyTrack,host?host.lt:"",host?host.lm:""].join("|");
+  if(sig!==MP.ctlSig){
+    MP.ctlSig=sig;
+    const ctl=el("mpCtl");
+    if(iHost){
+      const opts=CIRCUITS.map((c,i)=>(MP.lobbyMode==="race"&&c.freeOnly)?"":
+        `<option value="${i}"${i===MP.lobbyTrack?" selected":""}>${c.name}</option>`).join("");
+      ctl.innerHTML=`
+        <div class="seg">
+          <button data-m="race" class="${MP.lobbyMode==="race"?"on":""}">Race · ${TOTAL_LAPS} laps</button>
+          <button data-m="free" class="${MP.lobbyMode==="free"?"on":""}">Free drive</button>
+        </div>
+        <div class="mpform"><label for="mpTrack">Circuit</label><select id="mpTrack">${opts}</select></div>`;
+      [...ctl.querySelectorAll(".seg button")].forEach(b=>b.onclick=()=>{
+        MP.lobbyMode=b.dataset.m; mpSendLobby(); mpRefreshLobby();
+      });
+      el("mpTrack").onchange=()=>{ MP.lobbyTrack=+el("mpTrack").value; mpSendLobby(); mpRefreshLobby(); };
+    } else {
+      const c=CIRCUITS[MP.lobbyTrack];
+      ctl.innerHTML=`<p class="sub" style="margin-top:16px">Host's pick: <b>${c.name}</b> · ${MP.lobbyMode==="race"?TOTAL_LAPS+"-lap race":"free drive"}</p>`;
+    }
+  }
+  const st=el("mpStart");
+  if(st){
+    st.disabled=!iHost;
+    st.textContent=iHost?(MP.lobbyMode==="race"?"Start race":"Start free drive"):"Waiting for the host";
+  }
+}
+
+/* ── starting a session ── */
+
+function mpStartRace(){
+  if(!MP.room) return;
+  const ps=mpPlayers();
+  if(!ps.length||!ps[0].me) return;
+  const crew=ps.filter(p=>p.me||p.ph==="lobby").slice(0,MP_MAX);
+  const go={e:1+Math.floor(Math.random()*1e9), t:MP.lobbyTrack, m:MP.lobbyMode, r:crew.map(p=>[p.peer,p.nm,p.vh])};
+  MP.room.presence({go}).catch(()=>{});
+}
+
+function mpCheckGo(){
+  if(!MP.on||(state!=="lobby"&&state!=="garage")) return;
+  const host=mpPlayers()[0];
+  if(!host||!host.go) return;
+  const g=host.go;
+  if(typeof g.e!=="number"||g.e===MP.ep||!Array.isArray(g.r)) return;
+  const track=Math.floor(mpNum(g.t,-1));
+  if(!(track>=0&&track<CIRCUITS.length)) return;
+  const roster=g.r.slice(0,MP_MAX).filter(a=>Array.isArray(a)&&typeof a[0]==="string").map(a=>({
+    p:a[0], n:mpClean(a[1])||"DRIVER",
+    v:(()=>{ const v=Math.floor(mpNum(a[2],0)); return (v>=0&&v<VEHICLES.length)?v:0; })()
+  }));
+  if(!roster.some(r=>r.p===mpMyPeer())) return;       // started without us
+  mpBegin(track,g.m==="free"?"free":"race",g.e,roster);
+}
+
+function mpBegin(track,m,ep,roster){
+  MP.roster=roster; MP.ep=ep; MP.rem={}; MP.racing=true; MP.finSince=0; MP.boardHtml="";
+  mode=m;
+  mpIngest(MP.room.peers());
+  loadTrack(track);
+  overlay.classList.add("hidden");
+  resetRace();
+  MP.lastSend=0;
+  mpSendRace();
+}
+
+function mpToLobby(){
+  MP.racing=false; MP.finSince=0;
+  cars=buildField(); snapCam();
+  const patch={ph:"lobby",ep:null,x:null,y:null,z:null,a:null,s:null,vx:null,vy:null,st:null,ro:null,pi:null,
+               ni:null,ai:null,lp:null,ix:null,fn:null,ft:null,bl:null,dz:null};
+  const host=mpPlayers()[0];
+  if(host&&host.me) patch.go=null;
+  if(MP.room) MP.room.presence(patch).catch(()=>{});
+  mpSendLobby();
+  showLobby();
+}
+
+function mpShowPause(){
+  overlay.classList.remove("hidden");
+  ovc.innerHTML=`
+    <div class="eyebrow">Room ${MP.code.toUpperCase()} · ${CIRCUITS[pickedTrack].name}</div>
+    <h1 class="title">Menu</h1>
+    <p class="sub">A shared room can't be paused. Everyone else keeps driving while this is open.</p>
+    <button class="cta" id="mpResumeBtn">Back to the track</button>
+    <div class="btnrow">
+      <button class="ghost" id="mpLobbyBtn">Back to the paddock</button>
+      <button class="ghost" id="mpLeaveBtn2">Leave room</button>
+    </div>`;
+  el("mpResumeBtn").focus();
+  el("mpResumeBtn").onclick=mpResume;
+  el("mpLobbyBtn").onclick=mpToLobby;
+  el("mpLeaveBtn2").onclick=mpLeave;
+}
+function mpResume(){ overlay.classList.add("hidden"); }
+
+/* ── live traffic ── */
+
+function mpIngest(list){
+  const now=performance.now(), live={};
+  for(const p of list){
+    if(p.sameTab) continue;
+    live[p.peer]=1;
+    const prev=MP.rem[p.peer];
+    if(!prev||prev.pr!==p.presence) MP.rem[p.peer]={pr:p.presence, at:now};
+  }
+  for(const k in MP.rem) if(!live[k]) delete MP.rem[k];
+}
+
+function mpPeersChanged(ch){
+  if(!MP.on) return;
+  mpIngest(ch.peers);
+  if(MP.racing){
+    const live=new Set(ch.peers.map(p=>p.peer));
+    for(let i=cars.length-1;i>0;i--){
+      const c=cars[i]; if(!c.remote) continue;
+      const e=MP.rem[c.peer];
+      if(!live.has(c.peer)||(c.seen&&e&&e.pr.ph!=="race")) cars.splice(i,1);
+    }
+  }
+  if(state==="lobby") mpRefreshLobby();
+  mpCheckGo();
+}
+
+function mpSendRace(){
+  if(!MP.room||!MP.racing) return;
+  const p=cars[0]; if(!p||!p.human) return;
+  const R=(v,m)=>Math.round(mpNum(v)*m)/m;
+  const dz=p.dmgZone||{};
+  MP.room.presence({
+    ph:"race", ep:MP.ep,
+    x:R(p.x,10), y:R(p.y,10), z:R(p.z,10), a:R(p.ang,1000),
+    s:R(p.speed,10), vx:R(p.vx,10), vy:R(p.vy,10),
+    st:R(p.steer,100), ro:R(p.roll,100), pi:R(p.pitch,100), ni:R(p.nitroT||0,100), ai:p.air?1:0,
+    lp:p.lap|0, ix:p.idx|0, fn:p.finished?1:0, ft:R(p.finishT||0,100),
+    bl:p.bestLapT==null?null:R(p.bestLapT,100),
+    dz:[R(dz.front,100),R(dz.rear,100),R(dz.left,100),R(dz.right,100)]
+  }).catch(()=>{});
+}
+
+function mpTick(now){
+  if(!MP.racing||MP.dead) return;
+  if(state!=="racing"&&state!=="countdown") return;
+  if(now-MP.lastSend>66){ MP.lastSend=now; mpSendRace(); }
+}
+
+// ease a remote car toward where its owner says it is, a little ahead
+function mpApplyRemote(c,dt){
+  const e=MP.rem[c.peer]; if(!e) return;
+  const r=e.pr;
+  if(!r||r.ph!=="race"||r.ep!==MP.ep) return;
+  c.seen=true;
+  const age=Math.min(0.3,(performance.now()-e.at)/1000);
+  const vx=mpNum(r.vx), vy=mpNum(r.vy);
+  const tx=mpNum(r.x)+vx*age, ty=mpNum(r.y)+vy*age;
+  const far=Math.hypot(tx-c.x,ty-c.y)>160;
+  const k=far?1:1-Math.exp(-dt*14);
+  c.x+=(tx-c.x)*k; c.y+=(ty-c.y)*k;
+  c.z+=(mpNum(r.z)-c.z)*k; c.gz=c.z;
+  let da=mpNum(r.a)-c.ang;
+  while(da>Math.PI) da-=6.283185; while(da<-Math.PI) da+=6.283185;
+  c.ang+=da*(far?1:k);
+  c.vx=vx; c.vy=vy; c.speed=mpNum(r.s);
+  c.steer=mpNum(r.st); c.roll=mpNum(r.ro); c.pitch=mpNum(r.pi);
+  c.nitroT=mpNum(r.ni); c.air=!!r.ai;
+  c.lap=mpNum(r.lp)|0; c.idx=mpNum(r.ix)|0;
+  c.finished=!!r.fn; c.finishT=mpNum(r.ft);
+  c.bestLapT=(r.bl==null)?null:mpNum(r.bl);
+  const dz=Array.isArray(r.dz)?r.dz:[];
+  c.dmgZone={front:mpNum(dz[0]),rear:mpNum(dz[1]),left:mpNum(dz[2]),right:mpNum(dz[3])};
+  c.damage=Math.max(c.dmgZone.front,c.dmgZone.rear,c.dmgZone.left,c.dmgZone.right);
+}
+
+/* ── on-screen: standings panel and name tags ── */
+
+function mpBoard(){
+  const b=el("mpboard"); if(!b) return;
+  if(!(MP.on&&MP.racing&&(state==="racing"||state==="countdown"))){
+    if(MP.boardOn){ b.style.display="none"; MP.boardOn=false; }
+    return;
+  }
+  const racing=(mode==="race");
+  const order=racing?standings():cars.slice();
+  const html=order.map((c,i)=>{
+    const who=c.human?"YOU":mpClean(c.name);
+    const right=racing
+      ? (c.finished?"FIN":"L"+Math.min(Math.max(c.lap,1),TOTAL_LAPS))
+      : Math.round(Math.abs(c.speed)*0.62)+" km/h";
+    return `<div class="mprow${c.human?" me":""}"><span>${racing?(i+1)+" ":""}${who}</span><i>${right}</i></div>`;
+  }).join("");
+  if(html!==MP.boardHtml){ MP.boardHtml=html; b.innerHTML=html; }
+  if(!MP.boardOn){ b.style.display="block"; MP.boardOn=true; }
+}
+
+function mpNameTags(p){
+  ctx.save();
+  ctx.font="600 12px ui-monospace,Menlo,Consolas,monospace";
+  ctx.textAlign="center";
+  for(const c of cars){
+    if(!c.remote) continue;
+    const t=toCam(c.x,(c.gz||c.z||0)+24,c.y);
+    if(t[2]<NEAR||t[2]>1500) continue;
+    const sx=VW/2+t[0]*focal/t[2], sy=VH/2-t[1]*focal/t[2];
+    if(sx<-80||sx>VW+80||sy<-20||sy>VH+20) continue;
+    ctx.globalAlpha=Math.max(0.3,Math.min(1,1.25-t[2]/1200));
+    const label=mode==="race"?c.name+" · P"+c.place:c.name;
+    const w=ctx.measureText(label).width+16;
+    ctx.fillStyle="rgba(11,15,20,.74)"; ctx.fillRect(sx-w/2,sy-9,w,18);
+    ctx.fillStyle=c.color; ctx.fillRect(sx-w/2,sy-9,3,18);
+    ctx.fillStyle="#e8e3d8"; ctx.fillText(label,sx+1,sy+4);
+  }
+  ctx.restore();
 }
 
 /* ────────────────────────────── loop ────────────────────────────── */
@@ -4364,6 +5044,7 @@ function frame(now){
   }
   render();
   updateHud();
+  if(MP.on) mpTick(now);
   requestAnimationFrame(frame);
 }
 
